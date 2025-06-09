@@ -16,13 +16,40 @@
 #define PP_API_VERSION          1
 #define TRANSFER_BLOCK_SIZE     128
 #define SHELL_BUFFER_MAX        256
+#define MAX_APPLICATIONS        1
 
 static const char *TAG = "i2c_slave";
 
+//TODO, replace with external UART app
+// This is a simulated UART application for testing purposes.
+// In a real application, this would be replaced with the actual UART app binary.
 static uint8_t uart_app[] = {
-    0xAA, 0xBB, 0xCC, 0xDD,
-    [4 ... TRANSFER_BLOCK_SIZE - 1] = 0x00
+    // Header PortaPack App 
+    0x50, 0x50, 0x41, 0x50,  // "PPAP" - PortaPack App signature
+    0x01, 0x00, 0x00, 0x00,  // Version 1
+    0x55, 0x41, 0x52, 0x54,  // "UART"
+    0x00, 0x00, 0x00, 0x00,  // Padding
+    
+    // Simulated binary code for the UART app
+    0xE9, 0x00, 0x00, 0x00,  // Jump instruction
+    0x48, 0x65, 0x6C, 0x6C,  // "Hell"
+    0x6F, 0x20, 0x50, 0x6F,  // "o Po"
+    0x72, 0x74, 0x61, 0x50,  // "rtaP"
+    0x61, 0x63, 0x6B, 0x21,  // "ack!"
+    0x00, 0x00, 0x00, 0x00,  // Padding
+    
+    // more dummy instructions
+    0x90, 0x90, 0x90, 0x90,  // NOPs
+    0xC3, 0x00, 0x00, 0x00,  // RET instruction
+    
+    // fill the rest of the app with zeroes until the block size
+    [36 ... TRANSFER_BLOCK_SIZE - 1] = 0x00
 };
+
+
+// fill the rest of the app with dummy data
+
+
 static size_t uart_app_len = sizeof(uart_app);
 
 typedef enum {
@@ -97,6 +124,17 @@ static void uart_read_task(void *arg);
 static void handle_command(uint16_t cmd,
                            uint8_t *req_buf, size_t req_len,
                            uint8_t *resp_buf, size_t *resp_len);
+
+static void init_default_baudrate(void) {
+    // seek the default baudrate in the predefined list
+    for (int i = 0; i < sizeof(baudrates)/sizeof(baudrates[0]); i++) {
+        if (baudrates[i] == UART_BAUDRATE) {
+            current_baud_index = i;
+            break;
+        }
+    }
+    ESP_LOGI(TAG, "Default baudrate set to %d (index %d)", UART_BAUDRATE, current_baud_index);
+}
 // virtual UART queue management
 static void uart_queue_push(uint8_t byte) {
     size_t next = (uart_queue_head + 1) % UART_QUEUE_SIZE;
@@ -120,56 +158,110 @@ static size_t uart_queue_available(void) {
 }
 
 static size_t read_app_block(uint16_t index, size_t offset, uint8_t *out_buf, size_t max_len) {
-    if (index != 0) {
+    if (index >= MAX_APPLICATIONS) {
+        ESP_LOGW(TAG, "read_app_block: Invalid index %u", index);
         return 0;
     }
+    
     if (offset >= uart_app_len) {
+        ESP_LOGD(TAG, "read_app_block: Offset %zu beyond app size %zu", 
+                 offset, uart_app_len);
         return 0;
     }
+    
     size_t left = uart_app_len - offset;
     size_t to_copy = left < max_len ? left : max_len;
+    
     memcpy(out_buf, uart_app + offset, to_copy);
+    
+    ESP_LOGD(TAG, "read_app_block: index=%u, offset=%zu, copied=%zu", 
+             index, offset, to_copy);
+    
     return to_copy;
 }
 
 static void handle_info(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
     (void)req; (void)req_len;
+    
     device_info dev = {0};
     dev.api_version      = PP_API_VERSION;
     dev.module_version   = 1;
-    strncpy(dev.module_name, "ESP32 Module", sizeof(dev.module_name));
-    dev.application_count = 1; // solo 1 app (UART)
-    memcpy(resp, &dev, sizeof(dev));   // 32 bytes
+    strncpy(dev.module_name, "ESP32 Module", sizeof(dev.module_name)-1);
+    dev.application_count = MAX_APPLICATIONS;  
+    
+    memcpy(resp, &dev, sizeof(dev));
     *resp_len = sizeof(dev);
+    
+    ESP_LOGI(TAG, "Sent device info: API v%lu, %lu applications", dev.api_version, dev.application_count);
 }
 
 static void handle_app_info(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
-    (void)req_len;
+    if (req_len < 4) {
+        ESP_LOGW(TAG, "APP_INFO: insufficient data length %zu", req_len);
+        *resp_len = 0;
+        return;
+    }
+    
     uint16_t idx = (uint16_t)req[2] | ((uint16_t)req[3] << 8);
+    
     if (idx != 0) {
-        ESP_LOGW(TAG, "Invalid app index %u", idx);
+        ESP_LOGW(TAG, "Invalid app index %u (only index 0 available)", idx);
+        // TODO: investigate if we should return an error 
+        // *resp_len = 0;  
+        // return;
     }
 
     standalone_app_info app = {0};
     app.header_version = PP_API_VERSION;
     strncpy((char*)app.app_name, "UART", sizeof(app.app_name));
-    memset(app.bitmap_data, 0xFF, sizeof(app.bitmap_data));
-    app.icon_color    = 0x00FF00;
-    app.menu_location = DEBUG;
+    
+    uint8_t terminal_bitmap[32] = {
+        0xFF, 0xFF, 0xFF, 0xFF,  // ââââââââââââââââ
+        0x80, 0x00, 0x00, 0x01,  // â              â
+        0x80, 0x24, 0x24, 0x01,  // â              â
+        0x80, 0x00, 0x00, 0x01,  // â              â
+        0x80, 0x48, 0x48, 0x01,  // â              â
+        0x80, 0x00, 0x00, 0x01,  // â              â
+        0x80, 0x92, 0x92, 0x01,  // â              â
+        0xFF, 0xFF, 0xFF, 0xFF   // ââââââââââââââââ
+    };
+    memcpy(app.bitmap_data, terminal_bitmap, sizeof(app.bitmap_data));
+    
+    app.icon_color    = 0x00FF00;      // Green
+    app.menu_location = DEBUG;         // Place, DEBUG, no UTILITIES
     app.binary_size   = (uint32_t)uart_app_len;
+    
     memcpy(resp, &app, sizeof(app));
     *resp_len = sizeof(app);
-    ESP_LOGI(TAG, "Sent %u bytes of APP_INFO (name=UART)", (unsigned)uart_app_len);
+    
+    ESP_LOGI(TAG, "APP_INFO: Sent info for app 0 (UART, %u bytes)", 
+             (unsigned)sizeof(app));
+    ESP_LOGI(TAG, "Sent %zu bytes of APP_INFO for index %u (name=UART)", sizeof(app), idx);
 }
 
 static void handle_app_transfer(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
-    (void)req_len;
+    if (req_len < 6) {
+        ESP_LOGW(TAG, "APP_TRANSFER request too short (%zu bytes)", req_len);
+        *resp_len = 0;
+        return;
+    }
+    
     uint16_t idx = (uint16_t)req[2] | ((uint16_t)req[3] << 8);
     uint16_t blk = (uint16_t)req[4] | ((uint16_t)req[5] << 8);
+    
+    if (idx >= MAX_APPLICATIONS) {
+        ESP_LOGW(TAG, "Invalid app index %u for transfer (max: %d)", 
+                 idx, MAX_APPLICATIONS - 1);
+        *resp_len = 0;
+        return;
+    }
+    
     size_t offset = (size_t)blk * TRANSFER_BLOCK_SIZE;
     size_t copied = read_app_block(idx, offset, resp, TRANSFER_BLOCK_SIZE);
     *resp_len = copied;
-    ESP_LOGI(TAG, "Sent %u bytes in APP_TRANSFER (blk=%u)", (unsigned)copied, (unsigned)blk);
+    
+    ESP_LOGI(TAG, "APP_TRANSFER: app=%u, block=%u, offset=%zu, sent=%zu bytes",
+             idx, blk, offset, copied);
 }
 
 static void handle_getfeature_mask(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
@@ -220,30 +312,45 @@ static void handle_getfeat_data_light(uint8_t *req, size_t req_len, uint8_t *res
 }
 
 static void handle_shell_pptomod_data(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
-    (void)resp; (void)resp_len;
-    size_t payload = req_len - 2;
-    if (payload > SHELL_BUFFER_MAX) payload = SHELL_BUFFER_MAX;
-    memcpy(shell_buffer, &req[2], payload);
-    shell_buffer_len = payload;
+    ESP_LOGI(TAG, "Handling shell data from PPTOMOD (%zu bytes)", req_len);
+    if (req_len > 2) {
+        size_t payload = req_len - 2;  // Descontar los 2 bytes del comando
+        if (payload > SHELL_BUFFER_MAX) payload = SHELL_BUFFER_MAX;
+        
+        memcpy(shell_buffer, &req[2], payload);
+        shell_buffer_len = payload;
 
-    // Log HEX
-    char hexstr[3 * SHELL_BUFFER_MAX + 1] = {0};
-    char *h = hexstr;
-    for (size_t i = 0; i < payload; i++) {
-        sprintf(h, "%02X ", shell_buffer[i]);
-        h += 3;
-    }
-    ESP_LOGI(TAG, "Shell RX HEX: %s", hexstr);
+        // Log HEX 
+        char hexstr[3 * 32 + 1] = {0};
+        char *h = hexstr;
+        size_t log_bytes = payload < 32 ? payload : 32;
+        for (size_t i = 0; i < log_bytes; i++) {
+            sprintf(h, "%02X ", shell_buffer[i]);
+            h += 3;
+        }
+        ESP_LOGI(TAG, "Shell RX HEX (%zu bytes): %s%s", payload, hexstr, payload > 32 ? "..." : "");
 
-    // Log ASCII
-    char asciistr[SHELL_BUFFER_MAX + 1] = {0};
-    size_t ai = 0;
-    for (size_t i = 0; i < payload; i++) {
-        uint8_t c = shell_buffer[i];
-        if (c == '\n' || c == '\r') asciistr[ai++] = c;
-        else if (isprint(c))          asciistr[ai++] = c;
+        // Log ASCII
+        char asciistr[SHELL_BUFFER_MAX + 1] = {0};
+        size_t ai = 0;
+        for (size_t i = 0; i < payload && ai < SHELL_BUFFER_MAX - 1; i++) {
+            uint8_t c = shell_buffer[i];
+            if (c == '\n' || c == '\r') {
+                asciistr[ai++] = c;
+            } else if (isprint(c)) {
+                asciistr[ai++] = c;
+            } else {
+                //asciistr[ai++] = '.';  // its better to not include non-printable characters
+            }
+        }
+        ESP_LOGI(TAG, "Shell RX ASCII: %s", asciistr);
     }
-    ESP_LOGI(TAG, "Shell RX ASCII: %s", asciistr);
+    
+    // IMPORTANT: send ACK response
+    resp[0] = 0x00;  // Status OK
+    *resp_len = 1;   // Acknowledge the command
+    
+    ESP_LOGI(TAG, "Shell PPTOMOD processed %zu bytes, sent ACK", req_len > 2 ? req_len - 2 : 0);
 }
 
 static void handle_shell_modtopp_data_size(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
@@ -383,13 +490,13 @@ static void i2c_slave_init(void){
         .mode          = I2C_MODE_SLAVE,
         .slave = {
             .slave_addr    = ESP_SLAVE_ADDR,
-            .maximum_speed = 100000
+            .maximum_speed = 400000,  // increased to 400kHz
         }
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_SLAVE_NUM, &conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_SLAVE_NUM, I2C_MODE_SLAVE,
                                        I2C_SLAVE_RX_BUF_LEN, I2C_SLAVE_TX_BUF_LEN, 0));
-    ESP_LOGI(TAG, "I2C slave ready @0x%02X", ESP_SLAVE_ADDR);
+    ESP_LOGI(TAG, "I2C slave ready (400kHz) @0x%02X", ESP_SLAVE_ADDR);
 }
 
 static void uart_init(int baudrate){
@@ -409,16 +516,46 @@ static void uart_read_task(void *arg){
 static void i2c_slave_task(void *arg) {
     (void)arg;
     uint8_t recv_buf[512];
-    uint8_t resp_buf[TRANSFER_BLOCK_SIZE + 2];
+    uint8_t resp_buf[TRANSFER_BLOCK_SIZE + 16];
     size_t resp_len = 0;
+    int consecutive_errors = 0;
+
+    ESP_LOGI(TAG, "I2C slave task started, waiting for commands...");
 
     for (;;) {
         int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, recv_buf, sizeof(recv_buf),
-                                        pdMS_TO_TICKS(500));
+                                        pdMS_TO_TICKS(100));
+        // just for debug
+        if (len < 0) {
+            consecutive_errors++;
+            if (consecutive_errors > 10) {
+                ESP_LOGE(TAG, "Too many I2C errors, restarting...");
+                consecutive_errors = 0;
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            continue;
+        }
+        
         if (len < 2) {
             continue;
         }
+        
+        consecutive_errors = 0;  // reset error counter on successful read
+
         uint16_t cmd = (uint16_t)recv_buf[0] | ((uint16_t)recv_buf[1] << 8);
+        
+        ESP_LOGI(TAG, "Received command 0x%04X (%d bytes)", cmd, len);
+        
+        // Log hex dump
+        if (len > 2) {
+            char hex_str[64] = {0};
+            int hex_len = len > 8 ? 8 : len;
+            for (int i = 0; i < hex_len; i++) {
+                sprintf(hex_str + i*3, "%02X ", recv_buf[i]);
+            }
+            ESP_LOGD(TAG, "Data: %s%s", hex_str, len > 8 ? "..." : "");
+        }
+        
         resp_len = 0;
         memset(resp_buf, 0, sizeof(resp_buf));
 
@@ -426,13 +563,22 @@ static void i2c_slave_task(void *arg) {
 
         if (resp_len > 0) {
             int sent = i2c_slave_write_buffer(I2C_SLAVE_NUM, resp_buf, resp_len,
-                                              pdMS_TO_TICKS(500));
-            ESP_LOGI(TAG, "Sent %d bytes in response to cmd 0x%04X", sent, cmd);
+                                              pdMS_TO_TICKS(300));
+            if (sent > 0) {
+                ESP_LOGI(TAG, "Sent %d bytes in response to cmd 0x%04X", sent, cmd);
+            } else {
+                ESP_LOGW(TAG, "Failed to send response to cmd 0x%04X", cmd);
+            }
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void app_main(void){
+
+    ESP_LOGI(TAG, "Starting ESP32 I2C slave example, seeking for right baudrate...");
+    init_default_baudrate();
     
     i2c_slave_init();
     ESP_LOGI(TAG, "I2C slave initialized, waiting for commands...");
