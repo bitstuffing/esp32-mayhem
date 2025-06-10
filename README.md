@@ -5,7 +5,7 @@ The primary goal is to leverage a TTGO device, utilizing its built-in Wi-Fi, GPS
 
 This project is currently in its early stages and requires significant development. It serves as a proof-of-concept, featuring a custom implementation of an I2C slave driver. 
 
-The project also involves reverse engineering to understand the commands and responses of the device, as the original documentation is lacking. This project aims to provide clarity and insights into the device's operation.
+The project also involves reverse engineering to understand the commands and responses of the device, as the original documentation is lacking. This project aims to provide clarity and insights into the device's operation. Pure in C code.
 
 ## Status
 

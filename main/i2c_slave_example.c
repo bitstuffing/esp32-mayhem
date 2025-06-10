@@ -2,6 +2,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "driver/i2c.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,8 @@
 #define MAX_APPLICATIONS        1
 
 static const char *TAG = "i2c_slave";
+
+#define UART_RX_PIN          16 // GPIO for UART RX, just to compile, at this moment it's not used
 
 //TODO, replace with external UART app
 // This is a simulated UART application for testing purposes.
@@ -117,9 +120,11 @@ static const int baudrates[] = {
     460800, 576000, 921600, 1843200, 3686400
 };
 static int current_baud_index = 0;
+static uint32_t current_baudrate = UART_BAUDRATE; 
 
 static void i2c_slave_init(void);
 static void uart_init(int baudrate);
+static void uart_deinit(void);
 static void uart_read_task(void *arg);
 static void handle_command(uint16_t cmd,
                            uint8_t *req_buf, size_t req_len,
@@ -130,6 +135,7 @@ static void init_default_baudrate(void) {
     for (int i = 0; i < sizeof(baudrates)/sizeof(baudrates[0]); i++) {
         if (baudrates[i] == UART_BAUDRATE) {
             current_baud_index = i;
+            current_baudrate = UART_BAUDRATE;
             break;
         }
     }
@@ -399,26 +405,44 @@ static void handle_uart_request_long(uint8_t *req, size_t req_len, uint8_t *resp
 
 static void handle_uart_baud_inc(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
     (void)req; (void)req_len; (void)resp; (void)resp_len;
-    if (current_baud_index < (int)(sizeof(baudrates)/sizeof(baudrates[0])) - 1) {
+    
+    uart_deinit();  
+    
+    if (current_baud_index >= (int)(sizeof(baudrates)/sizeof(baudrates[0])) - 1) {
+        current_baud_index = 0; 
+    } else {
         current_baud_index++;
-        ESP_LOGI(TAG, "Baudrate increased to %d", baudrates[current_baud_index]);
     }
+    
+    current_baudrate = baudrates[current_baud_index];
+    uart_init(current_baudrate); // restart UART with new baudrate
+    
+    ESP_LOGI(TAG, "Baudrate increased to %lu", current_baudrate);
 }
 
 static void handle_uart_baud_dec(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
     (void)req; (void)req_len; (void)resp; (void)resp_len;
-    if (current_baud_index > 0) {
+    
+    uart_deinit();  // deinit UART
+    
+    if (current_baud_index <= 0) {
+        current_baud_index = (int)(sizeof(baudrates)/sizeof(baudrates[0])) - 1;  // Ir al final si estamos en el primero
+    } else {
         current_baud_index--;
-        ESP_LOGI(TAG, "Baudrate decreased to %d", baudrates[current_baud_index]);
     }
+    
+    current_baudrate = baudrates[current_baud_index];
+    uart_init(current_baudrate);  // restart UART with new baudrate
+    
+    ESP_LOGI(TAG, "Baudrate decreased to %lu", current_baudrate);
 }
 
 static void handle_uart_baud_get(uint8_t *req, size_t req_len, uint8_t *resp, size_t *resp_len) {
     (void)req; (void)req_len;
-    int br = baudrates[current_baud_index];
+    uint32_t br = current_baudrate;
     memcpy(resp, &br, sizeof(br));
     *resp_len = sizeof(br);
-    ESP_LOGI(TAG, "Returned baudrate %d", br);
+    ESP_LOGI(TAG, "Returned baudrate %lu", br);
 }
 
 static void handle_command(uint16_t cmd,
@@ -490,27 +514,68 @@ static void i2c_slave_init(void){
         .mode          = I2C_MODE_SLAVE,
         .slave = {
             .slave_addr    = ESP_SLAVE_ADDR,
-            .maximum_speed = 400000,  // increased to 400kHz
+            .maximum_speed = 100000,  // increased to 100kHz
         }
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_SLAVE_NUM, &conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_SLAVE_NUM, I2C_MODE_SLAVE,
                                        I2C_SLAVE_RX_BUF_LEN, I2C_SLAVE_TX_BUF_LEN, 0));
-    ESP_LOGI(TAG, "I2C slave ready (400kHz) @0x%02X", ESP_SLAVE_ADDR);
+    ESP_LOGI(TAG, "I2C slave ready (100kHz) @0x%02X", ESP_SLAVE_ADDR);
 }
 
 static void uart_init(int baudrate){
-    (void)baudrate;
-    ESP_LOGI(TAG, "UART virtual initialized (baud %d)", baudrate);
-    // TODO : here would be the UART initialization code
+    ESP_LOGI(TAG, "Initializing UART with baudrate %d", baudrate);
+    uart_config_t uart_config = {
+        .baud_rate = (int)baudrate,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    int intr_alloc_flags = 0;
+#if CONFIG_UART_ISR_IN_IRAM
+    intr_alloc_flags = ESP_INTR_FLAG_IRAM;
+#endif
+
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_PIN_NO_CHANGE, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    
+    ESP_LOGI(TAG, "UART initialized with baudrate %u", baudrate);
 }
 
-static void uart_read_task(void *arg){
+static void uart_deinit(void) {
+    ESP_ERROR_CHECK(uart_driver_delete(UART_PORT_NUM));
+    ESP_LOGI(TAG, "UART deinit");
+}
+
+static void uart_read_task(void *arg) {
     (void)arg;
-    for (;;) {
-        // TODO: replace with actual UART read code (from virtual UART websocket)
-        vTaskDelay(pdMS_TO_TICKS(500));
+    uint8_t *data = (uint8_t *)malloc(UART_BUF_SIZE);
+    
+    if (data == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for UART buffer");
+        vTaskDelete(NULL);
+        return;
     }
+    
+    ESP_LOGI(TAG, "UART read task started");
+    
+    while (1) {
+        int len = uart_read_bytes(UART_PORT_NUM, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(20));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                uart_queue_push(data[i]);
+            }
+            ESP_LOGD(TAG, "Read %d bytes from UART", len);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1)); 
+    }
+    
+    free(data);
 }
 
 static void i2c_slave_task(void *arg) {
@@ -585,8 +650,8 @@ void app_main(void){
     xTaskCreatePinnedToCore(i2c_slave_task, "i2c_slave_task", 4096, NULL, 10, NULL, 1);
     ESP_LOGI(TAG, "I2C slave task started, ready to receive commands.");
     
-    uart_init(UART_BAUDRATE);
+    uart_init(current_baudrate);
     xTaskCreate(uart_read_task, "uart_read_task", 4096, NULL, 10, NULL);
-    ESP_LOGI(TAG, "UART virtual task started.");
+    ESP_LOGI(TAG, "UART virtual task started with baudrate %lu", current_baudrate);
     
 }
