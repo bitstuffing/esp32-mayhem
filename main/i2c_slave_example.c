@@ -9,8 +9,6 @@
 #include "driver/spi_master.h"
 
 // TTGO T-Beam v1.1 Pin Configuration
-#define I2C_SLAVE_SCL_IO_TTGO        22
-#define I2C_SLAVE_SDA_IO_TTGO        21
 #define I2C_SLAVE_SCL_IO        15
 #define I2C_SLAVE_SDA_IO        23
 #define I2C_SLAVE_NUM           I2C_NUM_0
@@ -67,6 +65,9 @@
 #define OLED_CMD_CHARGE_PUMP        0x8D
 #define OLED_CMD_EXTERNAL_VCC       0x1
 #define OLED_CMD_SWITCH_CAP_VCC     0x2
+
+// OLED buffer (128x64 = 1024 bytes)
+static uint8_t oled_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
 
 // Simple 5x8 font for OLED
 static const uint8_t font5x8[][5] = {
@@ -727,7 +728,7 @@ static void i2c_slave_init(void){
     ESP_ERROR_CHECK(i2c_param_config(I2C_SLAVE_NUM, &conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_SLAVE_NUM, I2C_MODE_SLAVE,
                                        I2C_SLAVE_RX_BUF_LEN, I2C_SLAVE_TX_BUF_LEN, 0));
-    ESP_LOGI(TAG, "I2C slave ready (100kHz) @0x%02X", ESP_SLAVE_ADDR);
+    ESP_LOGI(TAG, "I2C slave ready (100kHz) @0x%02X on I2C_NUM_0", ESP_SLAVE_ADDR);
 }
 
 static void uart_init(int baudrate){
@@ -983,6 +984,59 @@ static void gps_uart_task(void *arg) {
     free(data);
 }
 
+static esp_err_t oled_write_command(uint8_t cmd) {
+    uint8_t data[2] = {0x00, cmd}; // 0x00 = command
+    return i2c_master_write_to_device(I2C_NUM_1, OLED_ADDR, data, 2, pdMS_TO_TICKS(100)); // Cambiar I2C_SLAVE_NUM por I2C_NUM_1
+}
+
+static esp_err_t oled_write_data(uint8_t *data, size_t len) {
+    uint8_t *buffer = malloc(len + 1);
+    if (!buffer) return ESP_ERR_NO_MEM;
+    
+    buffer[0] = 0x40; // 0x40 = data
+    memcpy(buffer + 1, data, len);
+    
+    esp_err_t ret = i2c_master_write_to_device(I2C_NUM_1, OLED_ADDR, buffer, len + 1, pdMS_TO_TICKS(100)); // Cambiar I2C_SLAVE_NUM por I2C_NUM_1
+    free(buffer);
+    return ret;
+}
+
+static void oled_clear_buffer(void) {
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+
+static void oled_write_string(int x, int y, const char *str) {
+    int len = strlen(str);
+    for (int i = 0; i < len && (x + i * 6) < OLED_WIDTH; i++) {
+        char c = str[i];
+        if (c >= ' ' && c <= 'Z') {
+            int char_index = c - ' ';
+            for (int col = 0; col < 5; col++) {
+                if ((x + i * 6 + col) < OLED_WIDTH && y < 8) {
+                    int buffer_pos = (y * OLED_WIDTH) + (x + i * 6 + col);
+                    if (buffer_pos < sizeof(oled_buffer)) {
+                        oled_buffer[buffer_pos] = font5x8[char_index][col];
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void oled_update_display(void) {
+    // configurate writing area
+    oled_write_command(OLED_CMD_COLUMN_ADDR);
+    oled_write_command(0);
+    oled_write_command(OLED_WIDTH - 1);
+    
+    oled_write_command(OLED_CMD_PAGE_ADDR);
+    oled_write_command(0);
+    oled_write_command(7);
+    
+    // send all data to OLED
+    oled_write_data(oled_buffer, sizeof(oled_buffer));
+}
+
 // Initialize GPS UART
 static void gps_uart_init(void) {
     uart_config_t uart_config = {
@@ -1021,12 +1075,100 @@ static void handle_getfeat_data_gps(uint8_t *req, size_t req_len, uint8_t *resp,
 
 // OLED Display functions 
 static void oled_init(void) {
-    //TODO: Implementar
+    // configurate I2C master for OLED
+    i2c_config_t conf_master = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = OLED_SDA_PIN,
+        .scl_io_num = OLED_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000,
+    };
+    
+    // keep I2C_NUM_1 for OLED (different to slave)
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_1, &conf_master));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_1, I2C_MODE_MASTER, 0, 0, 0));
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // SSD1306 sequence initialization
+    oled_write_command(OLED_CMD_DISPLAY_OFF);
+    oled_write_command(OLED_CMD_SET_DISPLAY_CLK_DIV);
+    oled_write_command(0x80);
+    oled_write_command(OLED_CMD_SET_MULTIPLEX);
+    oled_write_command(OLED_HEIGHT - 1);
+    oled_write_command(OLED_CMD_SET_DISPLAY_OFFSET);
+    oled_write_command(0x00);
+    oled_write_command(OLED_CMD_SET_START_LINE | 0x00);
+    oled_write_command(OLED_CMD_CHARGE_PUMP);
+    oled_write_command(0x14);
+    oled_write_command(OLED_CMD_MEMORY_MODE);
+    oled_write_command(0x00);
+    oled_write_command(OLED_CMD_SEG_REMAP | 0x01);
+    oled_write_command(OLED_CMD_COM_SCAN_DEC);
+    oled_write_command(OLED_CMD_SET_COM_PINS);
+    oled_write_command(0x12);
+    oled_write_command(OLED_CMD_SET_CONTRAST);
+    oled_write_command(0xCF);
+    oled_write_command(OLED_CMD_SET_PRECHARGE);
+    oled_write_command(0xF1);
+    oled_write_command(OLED_CMD_SET_VCOM_DETECT);
+    oled_write_command(0x40);
+    oled_write_command(OLED_CMD_DISPLAY_RAM);
+    oled_write_command(OLED_CMD_DISPLAY_NORMAL);
+    oled_write_command(OLED_CMD_DISPLAY_ON);
+    
+    oled_clear_buffer();
+    oled_update_display();
+    
     ESP_LOGI(TAG, "OLED SSD1306 initialized on I2C address 0x%02X", OLED_ADDR);
 }
 
+// dummy for this moment
 static void display_status(void) {
-    // TODO: Implementar
+    char line[32];
+    
+    oled_clear_buffer();
+    
+    // title
+    oled_write_string(0, 0, "T-Beam PortaPack");
+    
+    // GPS state
+    if (current_gps_data.sats_in_use > 0) {
+        snprintf(line, sizeof(line), "GPS: %d/%d sats", 
+                current_gps_data.sats_in_use, current_gps_data.sats_in_view);
+        oled_write_string(0, 1, line);
+        
+        snprintf(line, sizeof(line), "Lat:%.4f", current_gps_data.latitude);
+        oled_write_string(0, 2, line);
+        
+        snprintf(line, sizeof(line), "Lon:%.4f", current_gps_data.longitude);
+        oled_write_string(0, 3, line);
+        
+        snprintf(line, sizeof(line), "Alt:%.1fm Spd:%.1f", 
+                current_gps_data.altitude, current_gps_data.speed);
+        oled_write_string(0, 4, line);
+    } else {
+        oled_write_string(0, 1, "GPS: No Fix");
+        oled_write_string(0, 2, "Searching...");
+    }
+    
+    // UART status
+    snprintf(line, sizeof(line), "UART: %lu baud", current_baudrate);
+    oled_write_string(0, 5, line);
+    
+    // LoRa status
+    snprintf(line, sizeof(line), "LoRa: %.1fMHz %ddBm", 
+            lora_frequency / 1000000.0f, lora_power);
+    oled_write_string(0, 6, line);
+    
+    // queue data
+    size_t queue_size = uart_queue_available();
+    snprintf(line, sizeof(line), "Queue: %zu bytes", queue_size);
+    oled_write_string(0, 7, line);
+    
+    oled_update_display();
+    
     ESP_LOGD(TAG, "Display updated - GPS: Lat:%.6f Lon:%.6f Sats_use:%d Sats_view:%d", 
              current_gps_data.latitude, current_gps_data.longitude,
              current_gps_data.sats_in_use, current_gps_data.sats_in_view);
@@ -1038,6 +1180,10 @@ static void tbeam_gpio_init(void) {
     
     gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLUP_ONLY);
+    
+    // OLED GPIO setup
+    gpio_set_direction(OLED_SDA_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(OLED_SCL_PIN, GPIO_MODE_OUTPUT);
     
     // LoRa GPIO setup
     gpio_set_direction(LORA_SCK_PIN, GPIO_MODE_OUTPUT);
